@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "generatedUtc": "2026-09-14T00:00:00.0000000Z",
+  "tenantId": "00000000-0000-0000-0000-000000000000",
+  "kerberosRealm": "KERBEROS.MICROSOFTONLINE.COM",
+  "tgt": {
+    "renewThresholdMinutes": 45,
+    "maxRenewAttempts": 3,
+    "notifyUserOnFailure": true,
+    "allowTicketPurge": false
+  },
+  "preflight": {
+    "tcpTimeoutMs": 3000,
+    "maxAttempts": 6,
+    "backoffSeconds": [ 5, 10, 20, 30, 60, 60 ]
+  },
+  "mappings": [
+    {
+      "driveLetter": "X",
+      "label": "Company Files",
+      "uncPath": "\\\\stcloudpcfileseus01.file.core.windows.net\\cloudpc-data",
+      "required": true
+    }
+  ]
+}
