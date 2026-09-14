@@ -1,0 +1,7 @@
+{
+  "packageVersion": "1.0.0",
+  "taskName": "AzureFilesDriveMap",
+  "taskPath": "\\AzureFilesDriveMap\\",
+  "healIntervalMinutes": 30,
+  "logonDelaySeconds": 30
+}

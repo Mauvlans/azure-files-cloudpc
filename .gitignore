@@ -1,0 +1,18 @@
+# Ignore built Intune packages
+dist/
+*.intunewin
+
+# Generated config containing a real tenant ID / storage account.
+# The build script writes client/config.json for your environment - do not commit it.
+# client/config.sample.json is the template that ships in the repo.
+client/config.json
+
+# PowerShell / editor noise
+*.log
+.vscode/
+.idea/
+
+# Synology NAS metadata
+@eaDir/
+.DS_Store
+Thumbs.db

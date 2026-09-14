@@ -1,0 +1,102 @@
+name: Validate
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  powershell:
+    name: Parse + analyze (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Windows is where these actually run; Ubuntu catches anything accidentally
+        # platform-specific and keeps the feedback loop fast.
+        os: [windows-latest, ubuntu-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache PowerShell modules
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.os == 'Windows' && '~\Documents\PowerShell\Modules' || '~/.local/share/powershell/Modules' }}
+          key: psmodules-${{ runner.os }}-PSScriptAnalyzer-1.25.0
+
+      - name: Install PSScriptAnalyzer
+        shell: pwsh
+        run: |
+          if (-not (Get-Module -ListAvailable PSScriptAnalyzer)) {
+            Install-Module PSScriptAnalyzer -RequiredVersion 1.25.0 -Scope CurrentUser -Force
+          }
+
+      - name: Parse all scripts
+        shell: pwsh
+        run: |
+          $files = Get-ChildItem -Recurse -Filter *.ps1
+          $failed = 0
+          foreach ($f in $files) {
+            $errors = $null; $tokens = $null
+            [System.Management.Automation.Language.Parser]::ParseFile(
+              $f.FullName, [ref]$tokens, [ref]$errors) | Out-Null
+            if ($errors) {
+              $failed++
+              Write-Host "::error file=$($f.Name)::Parse failed"
+              $errors | ForEach-Object {
+                Write-Host "::error file=$($f.Name),line=$($_.Extent.StartLineNumber)::$($_.Message)"
+              }
+            }
+          }
+          Write-Host "Parsed $($files.Count) file(s); $failed failed."
+          if ($failed) { exit 1 }
+
+      - name: PSScriptAnalyzer
+        shell: pwsh
+        run: |
+          $results = Invoke-ScriptAnalyzer -Path . -Recurse -Settings ./PSScriptAnalyzerSettings.psd1
+          if ($results) {
+            $results | ForEach-Object {
+              $lvl = if ($_.Severity -eq 'Error') { 'error' } else { 'warning' }
+              Write-Host "::$lvl file=$($_.ScriptName),line=$($_.Line)::$($_.RuleName): $($_.Message)"
+            }
+            Write-Host "$($results.Count) finding(s)."
+            exit 1
+          }
+          Write-Host 'PSScriptAnalyzer clean.'
+
+  logic:
+    name: Agent decision-logic tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run tests
+        shell: pwsh
+        run: ./tests/Test-AgentLogic.ps1
+
+  config:
+    name: Config consistency
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Heal interval must be shorter than the renewal window
+        shell: pwsh
+        run: |
+          $mf  = Get-Content ./client/package.json      -Raw | ConvertFrom-Json
+          $cfg = Get-Content ./client/config.sample.json -Raw | ConvertFrom-Json
+          $heal = $mf.healIntervalMinutes
+          $thr  = $cfg.tgt.renewThresholdMinutes
+          Write-Host "heal=${heal}m threshold=${thr}m"
+          if ($heal -ge $thr) {
+            Write-Host "::error::healIntervalMinutes ($heal) must be < renewThresholdMinutes ($thr) or the agent can skip the renewal window entirely."
+            exit 1
+          }
+          if ($cfg.tgt.allowTicketPurge -ne $false) {
+            Write-Host "::error::allowTicketPurge must default to false - the destructive path is opt-in."
+            exit 1
+          }
+          Write-Host 'Config consistency OK.'
