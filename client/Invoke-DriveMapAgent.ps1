@@ -31,6 +31,7 @@
     which requires hybrid-joined clients. See the spec's "TGT ceiling" section.
 
     Exit codes: 0 success | 2 kerberos unrecoverable | 3 network unreachable | 4 map failed
+                5 unhandled exception (see the UNHANDLED line in the log, event 3006)
 #>
 [CmdletBinding()]
 param(
@@ -379,6 +380,12 @@ function Set-DriveMapping {
 Write-AgentLog "=== agent start (user=$env:USERNAME, host=$env:COMPUTERNAME, force=$Force) ==="
 Remove-OldLogs
 
+# Everything below runs inside try/catch. With $ErrorActionPreference='Stop' and no handler,
+# any unhandled exception terminates the script and the error goes to stderr - which the
+# scheduled task discards. The symptom is a log containing "agent start" and nothing else:
+# no error, no exit line, no clue. The failure path is the one that most needs logging.
+try {
+
 if (-not (Test-Path $ConfigPath)) {
     Write-AgentLog "Config not found at $ConfigPath" -Level Error -EventId 3000
     exit 4
@@ -456,6 +463,22 @@ foreach ($m in $config.mappings) {
 }
 
 if ($failedRequired -and $script:ExitCode -eq 0) { $script:ExitCode = 4 }
+
+}
+catch {
+    # Log the fault properly instead of dying silently to a discarded stderr stream.
+    $err = $_
+    Write-AgentLog "UNHANDLED: $($err.Exception.GetType().Name): $($err.Exception.Message)" -Level Error -EventId 3006
+    if ($err.InvocationInfo) {
+        Write-AgentLog "  at line $($err.InvocationInfo.ScriptLineNumber): $($err.InvocationInfo.Line.Trim())" -Level Error
+    }
+    if ($err.ScriptStackTrace) {
+        foreach ($frame in ($err.ScriptStackTrace -split "`r?`n")) {
+            if ($frame.Trim()) { Write-AgentLog "  $frame" -Level Error }
+        }
+    }
+    if ($script:ExitCode -eq 0) { $script:ExitCode = 5 }
+}
 
 Write-AgentLog "=== agent end (exit $script:ExitCode) ==="
 exit $script:ExitCode
