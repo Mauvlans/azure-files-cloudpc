@@ -73,6 +73,29 @@ regardless of the CA exclusion.
 IntuneWinAppUtil.exe -c .\client -s Install-DriveMapAgent.ps1 -o .\dist -q
 ```
 
+**Cross-platform alternative (recommended).** `IntuneWinAppUtil.exe` is Windows-only.
+`tools/Build-IntuneWinPackage.ps1` produces a byte-compatible package (ToolVersion 1.8.6.0)
+on Linux, macOS or Windows:
+
+```powershell
+Install-Module SvRooij.ContentPrep.Cmdlet -Scope CurrentUser   # once
+./tools/Build-IntuneWinPackage.ps1
+```
+
+It does three things the raw tool does not:
+
+- **Stages only the six runtime files.** Pointing `IntuneWinAppUtil -c` at `client/` sweeps in
+  whatever else is sitting there (`config.sample.json`, editor scratch files). The build
+  script ships an explicit allow-list.
+- **Refuses to package the placeholder tenant.** Shipping the unedited sample produces an app
+  that installs cleanly and then never maps a drive — a slow, confusing failure.
+- **Round-trips the package.** It decrypts the result and compares every file's SHA-256
+  against the source. A package that cannot decrypt to identical bytes is one Intune rejects
+  *after* upload, which is far harder to diagnose from the portal.
+
+Each build produces a different SHA-256 even from identical inputs — every package gets a
+fresh random AES-256 key and IV. That is expected, not a reproducibility defect.
+
 Package the **whole** `client` folder — the installer copies `Invoke-DriveMapAgent.ps1` and
 `config.json` out of it and fails fast if either is missing. `package.json` must be in the
 package too: it is the single source of truth for version and task identity, read by the
