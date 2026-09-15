@@ -97,11 +97,19 @@ try {
     if (-not (Test-Path $OutputPath)) { New-Item -ItemType Directory -Path $OutputPath -Force | Out-Null }
     $OutputPath = (Resolve-Path $OutputPath).Path
 
+    $pkg = Join-Path $OutputPath 'Install-DriveMapAgent.intunewin'
+
+    # The packer refuses to overwrite an existing file, so clear the previous build.
+    # Rebuilding after a code change is the normal case, not the exception.
+    if (Test-Path $pkg) {
+        Remove-Item $pkg -Force
+        Write-Host '     (removed previous build)' -ForegroundColor DarkGray
+    }
+
     New-IntuneWinPackage -SourcePath $stage `
                          -SetupFile (Join-Path $stage 'Install-DriveMapAgent.ps1') `
                          -DestinationPath $OutputPath -ErrorAction Stop | Out-Null
 
-    $pkg = Join-Path $OutputPath 'Install-DriveMapAgent.intunewin'
     if (-not (Test-Path $pkg)) { throw "Build reported success but $pkg does not exist." }
     Write-Ok "$pkg ($([math]::Round((Get-Item $pkg).Length / 1KB, 1)) KB)"
 
