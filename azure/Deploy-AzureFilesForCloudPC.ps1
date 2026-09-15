@@ -150,8 +150,41 @@ Assert-Module -Name @(
 
 Write-Step "Connecting to subscription $SubscriptionId"
 if (-not (Get-AzContext -ErrorAction SilentlyContinue)) { Connect-AzAccount | Out-Null }
-$ctx = Set-AzContext -Subscription $SubscriptionId
-$tenantId = $ctx.Tenant.Id
+# Set-AzContext honours -WhatIf and returns nothing in that mode, so read the tenant from
+# the resulting context rather than from its return value - otherwise the whole script is
+# undryrunnable and fails on "property 'Tenant' cannot be found".
+Set-AzContext -Subscription $SubscriptionId -WhatIf:$false -Confirm:$false | Out-Null
+$ctx = Get-AzContext
+if (-not $ctx) { throw "No Azure context after Set-AzContext. Run Connect-AzAccount first." }
+
+# Resolve the tenant from ARM - the authority on which tenant owns this subscription.
+# Neither $ctx.Tenant.Id nor $ctx.Subscription.TenantId can be trusted: when the session
+# was established with an explicit -Tenant (or has touched several tenants), both can
+# report a stale carry-over value. This ID is written into config.json and used to build
+# the Kerberos identifierUris, so a wrong one produces mount failures that look like
+# anything but a tenant problem.
+$tenantId = $null
+try {
+    # Note the ${} delimiters: "$SubscriptionId?api-version=..." makes PowerShell parse
+    # '$SubscriptionId?api' as the variable name and the call silently fails.
+    $subInfo = Invoke-AzRestMethod -Method GET -Path "/subscriptions/${SubscriptionId}?api-version=2022-12-01" -ErrorAction Stop
+    if ($subInfo.StatusCode -eq 200) {
+        $tenantId = ($subInfo.Content | ConvertFrom-Json).tenantId
+    }
+} catch {
+    Write-Warning "Could not resolve tenant from ARM: $($_.Exception.Message)"
+}
+
+if (-not $tenantId) {
+    $tenantId = $ctx.Subscription.TenantId
+    if (-not $tenantId) { $tenantId = $ctx.Tenant.Id }
+    Write-Warning "Falling back to the session context tenant ($tenantId). Verify it matches the subscription's real tenant."
+}
+if (-not $tenantId) { throw "Could not determine the tenant ID for subscription $SubscriptionId." }
+
+if ($ctx.Tenant.Id -and $ctx.Tenant.Id -ne $tenantId) {
+    Write-Warning "Session context tenant ($($ctx.Tenant.Id)) differs from the subscription's owning tenant ($tenantId). Using $tenantId."
+}
 Write-Ok "Tenant $tenantId"
 
 if (-not $PrivateEndpointSubnetName)      { $PrivateEndpointSubnetName      = $AncSubnetName }
@@ -431,7 +464,15 @@ $appDisplayName = "[Storage Account] $StorageAccountName.file.core.windows.net"
 
 $graphReady = $true
 try {
-    Assert-Module -Name @('Microsoft.Graph.Authentication', 'Microsoft.Graph.Applications')
+    # Microsoft.Graph.Identity.SignIns is required for the admin-consent step:
+    # Get-MgOauth2PermissionGrant / New-MgOauth2PermissionGrant live there, NOT in
+    # Microsoft.Graph.Applications. Omitting it means the script runs all the way to the
+    # consent step before failing with "term not recognized".
+    Assert-Module -Name @(
+        'Microsoft.Graph.Authentication',
+        'Microsoft.Graph.Applications',
+        'Microsoft.Graph.Identity.SignIns'
+    )
 } catch {
     $graphReady = $false
     Write-Warning $_.Exception.Message
@@ -450,14 +491,18 @@ if ($graphReady) {
 
         # --- cloud-only group SIDs ---------------------------------------------
         if ($EnableCloudOnlyGroupSids) {
-            $tag = 'kdc_enable_cloud_group_sids'
-            $tags = @()
-            if ($app.Tags) { $tags = @($app.Tags) }
-            if ($tags -contains $tag) {
-                Write-Skip "Tag '$tag' present"
-            } elseif ($PSCmdlet.ShouldProcess($appDisplayName, "Add tag '$tag'")) {
-                Update-MgApplication -ApplicationId $app.Id -Tags ($tags + $tag)
-                Write-Ok "Tag '$tag' added (cloud-only group SIDs in Kerberos tickets)"
+            $tagName = 'kdc_enable_cloud_group_sids'
+            # NOTE: do not name this variable $tags. PowerShell variable names are
+            # case-insensitive, so $tags and the script's [hashtable] $Tags parameter are
+            # the SAME variable - assigning an array to it fails with "Cannot convert
+            # System.Object[] to System.Collections.Hashtable" and kills the app config step.
+            $appTags = @()
+            if ($app.Tags) { $appTags = @($app.Tags) }
+            if ($appTags -contains $tagName) {
+                Write-Skip "Tag '$tagName' present"
+            } elseif ($PSCmdlet.ShouldProcess($appDisplayName, "Add tag '$tagName'")) {
+                Update-MgApplication -ApplicationId $app.Id -Tags ($appTags + $tagName)
+                Write-Ok "Tag '$tagName' added (cloud-only group SIDs in Kerberos tickets)"
             }
         }
 
