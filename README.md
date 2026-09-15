@@ -83,10 +83,20 @@ Read the spec for the full mitigation ladder before committing to a rollout date
 ## Prerequisites
 
 - Az PowerShell: `Az.Accounts`, `Az.Resources`, `Az.Storage`, `Az.Network`, `Az.PrivateDns`
-- Microsoft Graph: `Microsoft.Graph.Authentication`, `Microsoft.Graph.Applications`
+- Microsoft Graph: `Microsoft.Graph.Authentication`, `Microsoft.Graph.Applications`,
+  `Microsoft.Graph.Identity.SignIns` (required for `-GrantAdminConsent`)
 - Azure: Owner, or Contributor + User Access Administrator
 - Entra: Cloud Application Administrator or higher (to grant admin consent)
 - Cloud PC image: Windows 11 Enterprise 24H2 (build 26100) or later, current CU
+- Target Cloud PC must be **both** Entra joined (`trustType=AzureAd`) **and** on the ANC.
+  These are independent properties — verify both on the *same* machine before deploying.
+
+## Deployment record
+
+[`docs/Deployment-westus3.md`](docs/Deployment-westus3.md) is a real, verified run against a
+live tenant: environment pre-flight, why ServiceEndpoint was chosen over PrivateEndpoint on
+a vNet with on-prem DNS, every resource property read back from ARM/Graph, the four bugs the
+execution exposed, and teardown.
 
 ## Contributing
 
