@@ -47,8 +47,9 @@ tests/
    See `intune/Packaging-and-Assignment.md`.
 3. **Deploy the settings catalog policy** setting `CloudKerberosTicketRetrievalEnabled = 1`
    to the Cloud PC device group.
-3b. **Deploy the session time limits policy** (9h max session with forced sign-out). This is
-   the only deterministic answer to the TGT ceiling — do not defer it.
+3b. **Deploy the session time limits policy** (8h active limit with forced sign-out — the
+   settings catalog offers no 9h rung, and 12h would exceed the ~10h TGT). This is the only
+   deterministic answer to the TGT ceiling — do not defer it.
 4. **Set NTFS ACLs** once from a pilot Cloud PC, signed in as a member of the admin group
    (which holds *Storage File Data SMB Share Elevated Contributor*). Then drop that role.
 5. **Package and assign the Win32 app** to the Cloud PC device group.

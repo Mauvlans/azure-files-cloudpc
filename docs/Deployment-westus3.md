@@ -169,19 +169,53 @@ treat a single not-found as a broken deployment.
 
 ## 6. Remaining steps before the drive will actually map
 
-The Azure side is complete. **Nothing has yet been proven on the Cloud PC itself** — no
-mount has been attempted, no Kerberos ticket obtained. These four remain:
+The Azure side is complete and the Kerberos policy is deployed. **Nothing has yet been proven
+on the Cloud PC itself** — no mount has been attempted, no Kerberos ticket obtained.
+
+### Done — Intune Kerberos policy
+
+```powershell
+Connect-MgGraph -Scopes 'DeviceManagementConfiguration.ReadWrite.All','Group.Read.All'
+./intune/Deploy-IntunePolicies.ps1 -GroupId '00000000-0000-0000-0000-0000000000b1' -SkipSessionLimits
+```
+
+| Item | Value |
+|---|---|
+| Policy | `Cloud PC - Entra Kerberos TGT Retrieval` (`00000000-0000-0000-0000-0000000000c1`) |
+| Setting | `…kerberos_cloudkerberosticketretrievalenabled` = `…_1` (Enabled) |
+| Assigned to | `SSO - Cloud PCs` (`00000000-…`) — dynamic device group |
+| Verified | read back from Graph; re-run reports already-correct |
+
+**Settings-catalog IDs must be verified, not assumed.** The Kerberos ID was correct first
+time, but all three originally-assumed session-limit IDs were wrong — the real ones are
+ADMX-backed under `admx_terminalserver`, not under any `remotedesktopservices` path. Confirm
+any ID before building a policy body around it:
+
+```powershell
+Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/beta/deviceManagement/configurationSettings('<id>')"
+```
+
+Note that `configurationSettings` does **not** return an `@odata.nextLink`; it silently caps
+at `$top`. Use `$top=5000` and filter client-side, or you will search a truncated catalog and
+wrongly conclude a setting does not exist.
+
+### Deferred — session time limits
+
+Not deployed, pending a scoping decision. `SSO - Cloud PCs` is dynamic on
+`(device.deviceModel -startsWith "Cloud PC") -or (device.displayName -contains "AVD-")`, so it
+also contains five AVD session hosts (`MVN-AVD-PER-0/1`, `MVN-AVD-RA-0`, `AVD-W3-0`,
+`MVN-AVD-01$`) and the hybrid Cloud PC `CPC-User-CCCCCC`. The Kerberos policy is harmless to
+all of them; an 8-hour forced sign-out is not necessarily welcome on persistent AVD desktops.
+Either scope session limits to a Cloud-PC-only group, or accept the blast radius deliberately.
+
+### Still outstanding
 
 1. **Conditional Access exclusion.** Exclude the app
    `[Storage Account] examplestorageold.file.core.windows.net` from every MFA-requiring
    policy. Without it, mounts fail with **error 1327**. Requires a security owner decision —
    deliberately not automated. Compensating controls are already in place: service-endpoint
    isolation with default-deny, share-level RBAC, and NTFS ACLs.
-2. **Settings catalog policy** — `CloudKerberosTicketRetrievalEnabled = 1` to the Cloud PC
-   device group. Settings catalog, not OMA-URI.
-3. **Session time limits** (§7 of `Packaging-and-Assignment.md`) — 9h max with forced
-   sign-out. The only deterministic answer to the ~10h TGT ceiling.
-4. **NTFS ACLs + Win32 app.** Set root ACLs once from a pilot Cloud PC holding
+2. **NTFS ACLs + Win32 app.** Set root ACLs once from a pilot Cloud PC holding
    *Elevated Contributor*, then drop that role. Package `client/` and assign to the device
    group.
 
@@ -209,3 +243,11 @@ Two things the resource group does **not** cover, because they live outside it:
   (`appId 00000000-0000-0000-0000-0000000000e2`) and its service principal, plus the
   admin-consent grant. Delete via Entra admin center or
   `Remove-MgApplication -ApplicationId 00000000-0000-0000-0000-0000000000e1`.
+- The Intune policy `Cloud PC - Entra Kerberos TGT Retrieval`:
+
+  ```powershell
+  Invoke-MgGraphRequest -Method DELETE -Uri "https://graph.microsoft.com/beta/deviceManagement/configurationPolicies('00000000-0000-0000-0000-0000000000c1')"
+  ```
+
+  Note this setting is otherwise harmless to leave in place — it only enables cloud TGT
+  retrieval at logon and does not depend on the storage account existing.
