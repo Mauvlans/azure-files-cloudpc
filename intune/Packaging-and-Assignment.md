@@ -10,6 +10,19 @@ one Conditional Access exclusion.
 **Required.** Without it the client never requests a cloud TGT and every mount falls back to
 NTLM, which Azure Files rejects.
 
+> **Automated.** Run [`Deploy-IntunePolicies.ps1`](Deploy-IntunePolicies.ps1) to create and
+> assign this policy (and optionally the session limits in §7) via Graph:
+>
+> ```powershell
+> Connect-MgGraph -Scopes 'DeviceManagementConfiguration.ReadWrite.All','Group.Read.All'
+> ./intune/Deploy-IntunePolicies.ps1 -GroupId '<cloud-pc-device-group>' -WhatIf
+> ```
+>
+> Idempotent, supports `-WhatIf`, and **merges** assignments rather than overwriting them —
+> important when targeting a shared device group. Use `-SkipSessionLimits` to deploy only
+> the Kerberos policy. The table below documents what it creates, and remains the manual
+> path if you prefer the portal.
+
 | Field | Value |
 |---|---|
 | Platform | Windows 10 and later |
@@ -191,12 +204,29 @@ shorter than the ticket:
 
 | Setting | Value |
 |---|---|
-| Max session time (sign out, **not** disconnect) | 9 hours |
-| Idle session limit | 2 hours |
-| Disconnected session limit | 1 hour |
+| Set time limit for active Remote Desktop Services sessions | **8 hours** |
+| Set time limit for active but idle sessions | 2 hours |
+| Set time limit for disconnected sessions | 1 hour |
+| **End session when time limits are reached** | **Enabled** |
 
 Delivered via settings catalog → *Administrative Templates > Windows Components > Remote
-Desktop Services > Remote Desktop Session Host > Session Time Limits*.
+Desktop Services > Remote Desktop Session Host > Session Time Limits*, or automatically by
+`Deploy-IntunePolicies.ps1`.
+
+Two things that are easy to get wrong here, both verified against the live settings catalog:
+
+1. **The limits are fixed enums, not free integers.** The catalog exposes a ladder
+   (…1h, 2h, 3h, 6h, **8h**, 12h, 16h, 18h, 1 day…) and rejects anything else. **There is no
+   9-hour option.** 8h is the correct choice: 12h exceeds the ~10h TGT lifetime and defeats
+   the entire purpose of the policy.
+2. **"End session when time limits are reached" must be Enabled**, as a separate setting.
+   Without it, reaching the limit only *disconnects* the session — the logon session and its
+   dead cloud TGT survive, the drive stays broken, and the policy achieves nothing. This is
+   the single setting that makes the whole mitigation work.
+
+The ADMX-backed setting IDs (`…admx_terminalserver_ts_sessions_limits_2` and friends) are
+**not** under a `remotedesktopservices` policy path, which is where you would reasonably look
+for them first.
 
 The exchange this makes: an unpredictable mid-afternoon "access denied" that generates a
 support ticket becomes a predictable, announceable daily sign-in. It also turns the agent
