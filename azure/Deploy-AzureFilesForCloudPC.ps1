@@ -506,20 +506,52 @@ if ($graphReady) {
             }
         }
 
-        # --- privatelink identifierUris ----------------------------------------
+        # --- SPN case normalisation (ALL network modes) ------------------------
+        # Azure auto-creates the storage account's identifierUris in LOWERCASE
+        # ("cifs/<account>.file.core.windows.net"). Azure's own validator
+        # (Debug-AzStorageAccountAuth) requires UPPERCASE "CIFS/", and the storage service
+        # looks up the uppercase form when a client presents a service ticket.
+        #
+        # The symptom when this is wrong is vicious: Entra happily ISSUES a valid AES-256
+        # CIFS service ticket against the lowercase SPN, TCP 445 connects, and then SMB
+        # session setup fails - surfacing as an interactive "Enter the user name" prompt
+        # with NO entry in the SMB Security event log. It looks exactly like an
+        # authorization or credential problem and is neither.
+        #
+        # Graph rejects holding both cases at once (DuplicateValueInDifferentCase), so the
+        # lowercase entries must be REPLACED rather than supplemented.
+        $uris = @($app.IdentifierUris)
+        $spnHosts = @("$StorageAccountName.file.core.windows.net")
         if ($NetworkMode -eq 'PrivateEndpoint') {
-            $uris = @($app.IdentifierUris)
-            $wanted = @()
+            $spnHosts += "$StorageAccountName.privatelink.file.core.windows.net"
+        }
+
+        $wanted = @()
+        foreach ($h in $spnHosts) {
             foreach ($svc in 'HOST', 'CIFS', 'HTTP') {
-                $wanted += "api://$tenantId/$svc/$StorageAccountName.privatelink.file.core.windows.net"
-                $wanted += "$svc/$StorageAccountName.privatelink.file.core.windows.net"
+                $wanted += "api://$tenantId/$svc/$h"
+                $wanted += "$svc/$h"
             }
-            $toAdd = $wanted | Where-Object { $uris -notcontains $_ }
-            if (-not $toAdd) {
-                Write-Skip 'privatelink identifierUris present'
-            } elseif ($PSCmdlet.ShouldProcess($appDisplayName, 'Add privatelink identifierUris')) {
-                Update-MgApplication -ApplicationId $app.Id -IdentifierUris ($uris + $toAdd)
-                Write-Ok "Added $($toAdd.Count) privatelink identifierUris (prevents NTLM fallback / error 1326)"
+        }
+
+        # Anything that differs only by case is stale and must go.
+        $needsFix = @($uris | Where-Object {
+            $u = $_
+            ($wanted -notcontains $u) -and ($wanted | Where-Object { $_ -ieq $u })
+        })
+        $missing = @($wanted | Where-Object { $uris -notcontains $_ })
+
+        if (-not $needsFix -and -not $missing) {
+            Write-Skip 'identifierUris correct (uppercase SPNs present)'
+        } elseif ($PSCmdlet.ShouldProcess($appDisplayName, 'Normalise identifierUris to uppercase SPNs')) {
+            # Keep anything unrelated, drop the wrong-case duplicates, add the correct set.
+            $keep = @($uris | Where-Object { $u = $_; -not ($wanted | Where-Object { $_ -ieq $u }) })
+            $final = @($keep + $wanted) | Select-Object -Unique
+            Update-MgApplication -ApplicationId $app.Id -IdentifierUris $final
+            if ($needsFix) {
+                Write-Ok "Replaced $($needsFix.Count) lowercase SPN(s) with uppercase (fixes silent SMB auth failure)"
+            } else {
+                Write-Ok "Added $($missing.Count) identifierUri(s)"
             }
         }
 
