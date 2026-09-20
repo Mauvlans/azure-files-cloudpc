@@ -407,6 +407,34 @@ foreach ($h in $hosts) {
 
 # --- TGT health --------------------------------------------------------------
 $probePath = $config.mappings[0].uncPath
+
+# authMode selects the Kerberos model. Default 'EntraKerberos' preserves the
+# behaviour of configs written before this key existed.
+$authMode = 'EntraKerberos'
+if ($config.PSObject.Properties.Name -contains 'authMode' -and $config.authMode) {
+    $authMode = [string]$config.authMode
+}
+
+if ($authMode -eq 'ADDS') {
+    # On-prem AD DS Kerberos. The TGT is renewable (klist shows a Renew Time days
+    # out) and LSA renews it without help, so there is no ceiling to work around
+    # and nothing for this agent to re-acquire.
+    #
+    # Critically, the Entra path below must NOT run in this mode:
+    #   - dsregcmd /RefreshPrt refreshes the Entra PRT, which is unrelated to an
+    #     AD DS TGT and cannot mint one.
+    #   - a ticket-cache purge would discard live AD DS tickets, and unlike the
+    #     Entra cloud TGT they would be re-acquired against the DC - so a purge
+    #     is pointless churn at best and a mount outage at worst.
+    #
+    # Requirement in this mode is network line of sight to a DC, which the SMB
+    # preflight above does not prove. Mount failures here are almost always DC
+    # reachability or clock skew, not ticket lifetime.
+    Write-AgentLog 'authMode=ADDS - on-prem Kerberos renews natively; skipping cloud TGT logic'
+    $needsRenewal = $false
+    $tgt = [pscustomobject]@{ Present = $true; ParseFailed = $true; MinutesRemaining = $null; EndTime = $null }
+} else {
+
 $tgt = Get-CloudTgt -Realm $config.kerberosRealm
 
 if ($tgt.Present -and -not $tgt.ParseFailed) {
@@ -452,6 +480,8 @@ if ($needsRenewal) {
         # the next service ticket is needed.
     }
 }
+
+} # end authMode EntraKerberos branch
 
 # --- map ---------------------------------------------------------------------
 $failedRequired = $false

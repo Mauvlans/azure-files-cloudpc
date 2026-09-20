@@ -1,24 +1,39 @@
 {
-  "schemaVersion": 1,
-  "generatedUtc": "2026-09-14T00:00:00.0000000Z",
+  "schemaVersion": 2,
+  "generatedUtc": "2026-09-19T00:00:00.0000000Z",
+
+  "_comment_authMode": "EntraKerberos = cloud-only or hybrid users, no DC needed, ~10h TGT ceiling. ADDS = on-prem Kerberos, hybrid users only, requires DC line of sight, no TGT ceiling. Omitting this key defaults to EntraKerberos.",
+  "authMode": "EntraKerberos",
+
   "tenantId": "00000000-0000-0000-0000-000000000000",
   "kerberosRealm": "KERBEROS.MICROSOFTONLINE.COM",
+
+  "_comment_adds": "Only used when authMode is ADDS. netBiosDomainName is the pre-Windows-2000 name (e.g. CONTOSO), NOT the FQDN - the portal gets this wrong and it breaks Kerberos.",
+  "adds": {
+    "domainName": "contoso.com",
+    "netBiosDomainName": "CONTOSO",
+    "domainControllerHint": "dc01.contoso.com"
+  },
+
+  "_comment_tgt": "Only used when authMode is EntraKerberos. The ADDS path skips all of this - on-prem TGTs renew natively.",
   "tgt": {
     "renewThresholdMinutes": 45,
     "maxRenewAttempts": 3,
     "notifyUserOnFailure": true,
     "allowTicketPurge": false
   },
+
   "preflight": {
     "tcpTimeoutMs": 3000,
     "maxAttempts": 6,
     "backoffSeconds": [ 5, 10, 20, 30, 60, 60 ]
   },
+
   "mappings": [
     {
       "driveLetter": "X",
       "label": "Company Files",
-      "uncPath": "\\\\stcloudpcfileseus01.file.core.windows.net\\cloudpc-data",
+      "uncPath": "\\\\examplestorage.file.core.windows.net\\cloudpc-data",
       "required": true
     }
   ]
