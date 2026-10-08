@@ -535,11 +535,16 @@ if ($graphReady) {
         }
 
         # Anything that differs only by case is stale and must go.
+        # NOTE: -contains / -notcontains are CASE-INSENSITIVE in PowerShell, so they
+        # report a lowercase "cifs/..." as already matching the wanted "CIFS/...".
+        # That made this check silently pass on an account whose SPNs were all
+        # lowercase - the exact defect this block exists to fix. Use the
+        # case-sensitive -cnotcontains / -ceq throughout.
         $needsFix = @($uris | Where-Object {
             $u = $_
-            ($wanted -notcontains $u) -and ($wanted | Where-Object { $_ -ieq $u })
+            ($wanted -cnotcontains $u) -and ($wanted | Where-Object { $_ -ieq $u })
         })
-        $missing = @($wanted | Where-Object { $uris -notcontains $_ })
+        $missing = @($wanted | Where-Object { $uris -cnotcontains $_ })
 
         if (-not $needsFix -and -not $missing) {
             Write-Skip 'identifierUris correct (uppercase SPNs present)'
