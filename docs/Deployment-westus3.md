@@ -1,10 +1,10 @@
-# Deployment record — westus3, Example Corp
+# Deployment record — westus3, <org>
 
 Live deployment of the Azure side of this solution. Recorded because the execution found
 four bugs that no amount of parsing, linting or offline testing would have caught, and
 because the environment findings here generalise to any ANC deployment.
 
-**Executed:** 2026-09-15 · **Region:** westus3 · **Operator:** <operator-upn>
+**Executed:** 2026-09-15 · **Region:** westus3 · **Operator:** <operator>
 
 ---
 
@@ -12,8 +12,8 @@ because the environment findings here generalise to any ANC deployment.
 
 | Item | Value |
 |---|---|
-| Subscription | `Example Subscription` (`00000000-0000-0000-0000-000000000001`) |
-| Tenant | `00000000-0000-0000-0000-000000000000` (Example Corp) |
+| Subscription | `<subscription>` (`00000000-0000-0000-0000-000000000001`) |
+| Tenant | `00000000-0000-0000-0000-000000000000` (<org>) |
 | Caller roles | Owner + User Access Administrator |
 | ANC vNet | `<anc-vnet>` (`<network-rg>`), `10.x.0.0/16`, westus3 |
 | ANC subnet | `<anc-subnet>` `10.x.2.0/24` |
@@ -45,13 +45,13 @@ with no vNIC in the vNet. Neither could have worked. Deployment waited until
 
 **This is the single most important environment finding.**
 
-`<anc-vnet>` DNS is set to `10.20.30.40` — an on-premises DNS server reached over the
+`<anc-vnet>` DNS is set to `<on-prem-dns-ip>` — an on-premises DNS server reached over the
 `<s2s-vpn-gateway>` IPsec S2S VPN (local network gateway prefix `10.0.0.0/16`). The subscription
 has **zero private DNS zones** and **no Azure DNS Private Resolver**.
 
 With `-NetworkMode PrivateEndpoint` the script would have created and linked
 `privatelink.file.core.windows.net` correctly — and it would still have failed. The Cloud PC
-asks `10.20.30.40` for DNS, that server has no conditional forwarder to Azure DNS
+asks `<on-prem-dns-ip>` for DNS, that server has no conditional forwarder to Azure DNS
 (`168.63.129.16`), so `<account>.file.core.windows.net` resolves to the **public** IP while
 the storage firewall denies public access. The mount fails with a network error that looks
 nothing like a DNS problem, and the private DNS zone looks perfectly healthy in the portal.
@@ -203,8 +203,7 @@ wrongly conclude a setting does not exist.
 
 Not deployed, pending a scoping decision. `<cloud-pc-device-group>` is dynamic on
 `(device.deviceModel -startsWith "Cloud PC") -or (device.displayName -contains "AVD-")`, so it
-also contains five AVD session hosts (`<avd-host-1>/1`, `<avd-host-3>`, `<avd-host-4>`,
-`<avd-host-5>$`) and the hybrid Cloud PC `CPC-User-CCCCCC`. The Kerberos policy is harmless to
+also contains five AVD session hosts (`<avd-host-1..5>`) and the hybrid Cloud PC `CPC-User-CCCCCC`. The Kerberos policy is harmless to
 all of them; an 8-hour forced sign-out is not necessarily welcome on persistent AVD desktops.
 Either scope session limits to a Cloud-PC-only group, or accept the blast radius deliberately.
 

@@ -49,7 +49,7 @@ tests/
 docs/
   Deployment-westus3.md             A real verified deployment: environment findings,
                                     results read back from ARM/Graph, bugs found, teardown.
-  Deployment-westus3-<storageaccount>.md  Second deployment. Root cause of a credential-prompt
+  Deployment-second-run.md          Second deployment. Root cause of a credential-prompt
                                     failure: share RBAC and the NTFS ACL named different
                                     groups. Current SMB settings and outstanding work.
   Set-RootAcl-RestApi.md            Set the share-root NTFS ACL from Linux/macOS over the
@@ -488,12 +488,13 @@ live tenant: environment pre-flight, why ServiceEndpoint was chosen over Private
 a vNet with on-prem DNS, every resource property read back from ARM/Graph, the four bugs the
 execution exposed, and teardown.
 
-[`docs/Deployment-westus3-<storageaccount>.md`](docs/Deployment-westus3-<storageaccount>.md) records a
+[`docs/Deployment-second-run.md`](docs/Deployment-second-run.md) records a
 second deployment, worth reading for two things the first did not hit: a bug in this repo's
 own SPN-case idempotency check that reported success on an entirely lowercase account, and
 the root cause of a credential-prompt mount failure — **share-level RBAC and the NTFS root
-ACL named different groups**. It also documents the current (deliberately lowered) SMB
-settings on that account and the work still outstanding.
+ACL named different groups**. It also covers why lowering SMB security is the wrong response
+to that symptom, and the three client-side defects found only by running the agent on a real
+Cloud PC.
 
 ## Contributing
 
