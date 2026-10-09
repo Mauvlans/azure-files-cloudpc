@@ -26,7 +26,9 @@ azure/
 client/
   Install-DriveMapAgent.ps1         Win32 app install (SYSTEM). Registers the scheduled task.
   Uninstall-DriveMapAgent.ps1       Win32 app uninstall.
-  Detect-DriveMapAgent.ps1          Win32 app detection script.
+  Detect-DriveMapAgent.ps1          Detection rule TEMPLATE. The builder stamps the version
+                                    in and writes dist/Detect-DriveMapAgent.ps1 - upload
+                                    that, not this.
   Invoke-DriveMapAgent.ps1          The agent. User context. Maps drives and manages the
                                     Entra Kerberos cloud TGT.
   Test-DriveMapReadiness.ps1        Ten-point diagnostic for pilot and support.
@@ -55,13 +57,39 @@ docs/
   AD-DS-Auth-Notes.md               AD DS (vs Entra Kerberos) auth notes and gotchas.
 ```
 
-## Step-by-step deployment guide
+## Deployment at a glance
 
-Follow these in order. **The order is not cosmetic** — steps 4 and 7 must both be done before
-step 8, or the agent installs successfully and then fails every mount, and you will spend your
-time debugging the agent instead of the thing actually blocking it.
+Nine steps. **Three require a human** — they cannot be scripted, and skipping any of them
+produces a mount failure that looks like something else entirely.
+
+| # | Step | Who | Why it cannot be skipped |
+|---|---|---|---|
+| 0 | Confirm the target Cloud PC qualifies | you | Entra joined **and** on the ANC. Nothing works otherwise |
+| 1 | Run the Azure build script | automated | Storage, share, Entra Kerberos, networking, RBAC, Entra app |
+| 2 | Verify Entra Kerberos against ARM/Graph | you | The build script can report a false pass on the SPNs |
+| 3 | Run the Intune policy script | automated | Without the Kerberos policy every mount falls back to NTLM |
+| 4 | **Conditional Access exclusion** | 🔴 **MANUAL** | Error 1327 on every mount. Needs a security owner's sign-off |
+| 5 | Confirm the policy reached LSA | you | Assigned ≠ applied |
+| 6 | Wait ~30 min for RBAC propagation | — | Testing early looks like a permissions bug |
+| 7 | **Set NTFS ACLs on the share root** | 🔴 **MANUAL** | RBAC gets you *to* the share; NTFS decides what you can do *inside* |
+| 8 | Build and assign the Win32 app | you | Nothing maps the drive until the agent is deployed |
+| 9 | Validate on the pilot Cloud PC | you | Only a successful mount proves the scenario |
+
+**Steps 4 and 7 must both be done before step 8.** Otherwise the agent installs perfectly and
+fails every mount, and you will spend your time debugging the agent rather than the thing
+actually blocking it.
+
+The three manual actions in full:
+
+1. **Step 4 — CA exclusion.** Exclude `[Storage Account] <acct>.file.core.windows.net` from
+   every MFA-requiring policy. Not automatable; needs a security owner.
+2. **Step 7 — NTFS root ACL.** Grant the **same group** that holds the share-level RBAC role.
+   A different group here is the single easiest way to build a share nobody can mount.
+3. **Step 8 — Intune portal upload.** Create the Win32 app and assign it to a **device** group.
 
 Budget roughly 90 minutes end to end, most of it waiting on propagation.
+
+## Step-by-step deployment guide
 
 ---
 
@@ -134,22 +162,19 @@ Output: `client/config.json`, containing your tenant ID and UNC path.
 
 ---
 
-### Step 2 — Configure and verify Microsoft Entra Kerberos ⚠️ VERIFY, DO NOT ASSUME
+### Step 2 — Verify Entra Kerberos ⚠️ VERIFY, DO NOT ASSUME
 
-Step 1 already turns Entra Kerberos on (`directoryServiceOptions = AADKERB`) and configures the
-auto-created Entra application. **Verify it anyway.** Read every value back from ARM and Graph
-rather than trusting the script's own output — a build that printed "already correct" for the
-SPNs has shipped an account whose SPNs were entirely lowercase.
+Step 1 already enables Entra Kerberos and configures the auto-created Entra application.
+**Verify it anyway** — a build that printed "already correct" for the SPNs has shipped an
+account whose SPNs were entirely lowercase. Read the values back from the API, not from the
+script's output.
 
 ```bash
 ACCT=<storageAccountName>; RG=<rg>; SUB=<sub-guid>
 
-# 1. Entra Kerberos is the account-wide identity source
 az rest --method get --url "https://management.azure.com/subscriptions/$SUB/resourceGroups/$RG/providers/Microsoft.Storage/storageAccounts/$ACCT?api-version=2023-05-01" \
   | python3 -c "import json,sys;print(json.load(sys.stdin)['properties']['azureFilesIdentityBasedAuthentication'])"
-# expect: {'directoryServiceOptions': 'AADKERB'}
 
-# 2. The Entra app: UPPERCASE SPNs, cloud-SID tag, admin consent
 az rest --method get --url "https://graph.microsoft.com/v1.0/applications?\$filter=startswith(displayName,'[Storage Account] $ACCT')" \
   | python3 -c "
 import json,sys
@@ -158,24 +183,17 @@ print('appId:',a['appId']);print('tags :',a.get('tags'))
 [print('  uri:',u) for u in a['identifierUris']]"
 ```
 
-Three things must all be true:
+All four must hold:
 
 | Check | Expected | If wrong |
 |---|---|---|
 | `directoryServiceOptions` | `AADKERB` | Re-run step 1 |
-| `identifierUris` | **six** entries, all **UPPERCASE** `HOST/` `CIFS/` `HTTP/` (bare + `api://<tenant>/…`) | See below |
+| `identifierUris` | **six** entries, all **UPPERCASE** `HOST/` `CIFS/` `HTTP/` (bare + `api://<tenant>/…`) | Fix below |
 | `tags` | contains `kdc_enable_cloud_group_sids` | Re-run step 1 with `-EnableCloudOnlyGroupSids` |
 | Admin consent | `AllPrincipals` — `openid profile User.Read` | Re-run step 1 with `-GrantAdminConsent` |
 
-**The SPN case trap.** Azure auto-creates these URIs in **lowercase** (`cifs/…`). Azure's own
-validator demands the uppercase form, and a lowercase SPN produces the single most misleading
-failure in this whole solution: Entra issues a valid AES-256 CIFS ticket, TCP 445 connects, the
-SMB session establishes — and then session setup surfaces as an interactive **"Enter the user
-name"** prompt with *no entry in the SMB Security event log at all*. It reads exactly like a
-credential or permissions problem and is neither.
-
-Graph rejects both cases at once (`DuplicateValueInDifferentCase`), so **replace** the set,
-never append:
+**If the SPNs are lowercase**, replace the whole set — Graph rejects both cases at once
+(`DuplicateValueInDifferentCase`), so you cannot append:
 
 ```powershell
 $objId = '<application objectId>'; $t = '<tenantId>'; $acct = '<account>.file.core.windows.net'
@@ -184,36 +202,14 @@ foreach ($svc in 'HOST','CIFS','HTTP') { $uris += "api://$t/$svc/$acct"; $uris +
 Update-MgApplication -ApplicationId $objId -IdentifierUris $uris
 ```
 
-Then on any client that already tried a mount: `klist purge`, followed by a **full sign-out and
-sign-in** — not a disconnect. The cloud TGT is supplied at logon and cannot be re-minted
+Then on any client that already tried a mount: `klist purge`, followed by a **full sign-out
+and sign-in** — not a disconnect. The cloud TGT is supplied at logon and cannot be re-minted
 mid-session.
 
-> **Why this is a step and not a footnote.** `-contains` in PowerShell is case-insensitive, so
-> an idempotency check written the obvious way reports lowercase SPNs as already-correct. That
-> bug shipped in this repo and was only caught by reading Graph directly. Verify against the
-> API, not against a script's success message.
-
-Optionally run Microsoft's validator from a domain-reachable Windows box — it names the fault
-in one line and is worth more than any amount of symptom-reading:
-
-```powershell
-Install-Module AzFilesHybrid -Scope CurrentUser
-Debug-AzStorageAccountAuth -StorageAccountName $ACCT -ResourceGroupName $RG `
-  -UserName <upn> -FileShareName <share> -Verbose
-```
-
-Omitting `-UserName`/`-FileShareName` makes `CheckRBAC` report **Failed** when it simply could
-not run. That is not a finding.
-
-**Two more validator results that are NOT findings, when your users are cloud-only:**
-
-| Reported | Why it is not a fault |
-|---|---|
-| `CheckRBAC` — *"User is a cloud-only user, cannot have RBAC access"* | A validator limitation: it looks for an `onPremisesSecurityIdentifier` and gives up when there is none. Entra Kerberos explicitly supports cloud-only identities — that is what the `kdc_enable_cloud_group_sids` tag is for. Confirm the share-scope role assignment exists and move on. |
-| `CheckRegKey` — Failed, while `Lsa\Kerberos\Parameters` shows `1` and `klist` holds a CIFS ticket | It reads the PolicyManager CSP path, not the LSA path. **A CIFS ticket cannot be obtained with cloud retrieval disabled**, so the ticket outranks the check. |
-
-If these two are the validator's only failures, it has found nothing. Do not invent a theory
-to explain them — move to the layer it does not inspect: the NTFS ACL (step 7).
+> Why lowercase SPNs matter so much: Entra still issues a valid AES-256 CIFS ticket, TCP 445
+> still connects, and session setup then fails as an interactive **"Enter the user name"**
+> prompt with *no entry in the SMB Security event log*. It reads exactly like a credential
+> problem and is neither. See [troubleshooting](#troubleshooting).
 
 ---
 
@@ -328,10 +324,22 @@ Install-Module SvRooij.ContentPrep.Cmdlet -Scope CurrentUser   # once
 ./tools/Build-IntuneWinPackage.ps1
 ```
 
-Produces `dist/Install-DriveMapAgent.intunewin`, verified by round-trip decryption. Works on
-Linux and macOS as well as Windows — `IntuneWinAppUtil.exe` is not required.
+Produces **two** files in `dist/`, verified by round-trip decryption. Works on Linux and macOS
+as well as Windows — `IntuneWinAppUtil.exe` is not required.
 
-Upload to Intune → **Apps → Windows → Add → Windows app (Win32)**:
+| File | Use |
+|---|---|
+| `dist/Install-DriveMapAgent.intunewin` | The app package you upload |
+| `dist/Detect-DriveMapAgent.ps1` | The detection rule script — **upload this one** |
+
+> **Use the generated detection script, not `client/Detect-DriveMapAgent.ps1`.** Intune does
+> not run detection scripts from the package: the Management Extension copies the script
+> *content* elsewhere and runs it with nothing beside it, so a script that reads `package.json`
+> at runtime always fails closed and the app reinstalls on every evaluation cycle. The builder
+> stamps the expected version into the generated copy. The source template refuses to report
+> detected if uploaded by mistake.
+
+🔴 **MANUAL** — Intune portal → **Apps → Windows → Add → Windows app (Win32)**:
 
 | Field | Value |
 |---|---|
@@ -341,12 +349,16 @@ Upload to Intune → **Apps → Windows → Add → Windows app (Win32)**:
 | Architecture | 64-bit |
 | Minimum OS | Windows 11 22H2 |
 | Requirement rule | Registry `HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\CurrentBuild` ≥ `26100` |
-| Detection | **Custom script** → `client/Detect-DriveMapAgent.ps1`, 64-bit, *not* as logged-on user |
+| Detection | **Custom script** → `dist/Detect-DriveMapAgent.ps1`, 64-bit, *not* as logged-on user |
 | Assignment | **Required** → Cloud PC **device** group |
 
 **Nothing maps the drive until this step is done.** The scheduled task that creates the mapping
 is registered by the installer; with no app deployed, there is no agent on the device and `X:`
 will simply never appear.
+
+**Upgrading an existing deployment?** Bump `packageVersion` in `client/package.json` before
+building. Detection matches on that exact version, so an unchanged version makes already-
+deployed devices report compliant and silently skip the new agent.
 
 ---
 
@@ -371,6 +383,8 @@ Start with `Test-DriveMapReadiness.ps1`. Then match the symptom:
 |---|---|
 | **`X:` never appears at all** | The Win32 app is not installed (step 8). No app means no scheduled task, and nothing creates the mapping. Verify: `Get-ScheduledTask -TaskPath '\AzureFilesDriveMap\'` |
 | **Scheduled task returns `0x4`, but running the agent manually works** | That is the agent's own exit code, not a Task Scheduler fault — a `required` mapping failed. At an `-AtLogOn` trigger the agent can run before CloudAP has delivered the cloud TGT, so the mount fails and the next run succeeds unaided. Agent ≥1.2.0 waits for the ticket and reports this case as **`0x6`** (transient) instead. On `0x4`, read the log: a real failure has a valid TGT in it. |
+| **App reinstalls on every Intune evaluation cycle** | The detection rule is the unbuilt template (`client/Detect-DriveMapAgent.ps1`) instead of the generated `dist/Detect-DriveMapAgent.ps1`, so it can never report detected. Rebuild and re-upload the detection script |
+| **A new agent version never reaches devices** | `packageVersion` was not bumped, so detection matches the already-installed version and Intune considers the device compliant |
 | **Credential prompt** ("Enter the user name") with a valid CIFS ticket in `klist` and *no* SMB Security event | Two possible causes, both of which pass every individual check: (a) lowercase SPNs in the Entra app's `identifierUris` (step 2); (b) **share RBAC and the NTFS root ACL name different groups** (steps 1 and 7) — each gate is valid alone, but no principal clears both |
 | **Error 1327** on mount | Conditional Access exclusion missing (step 4) |
 | **Error 1326** on mount | Private endpoint mode with the privatelink FQDN missing from the app's `identifierUris` |
@@ -406,6 +420,28 @@ Get-Content "$env:ProgramData\Microsoft\IntuneManagementExtension\Logs\IntuneMan
 ```
 
 Event IDs are documented in [`intune/Packaging-and-Assignment.md`](intune/Packaging-and-Assignment.md) §5.
+
+### Microsoft's validator
+
+`Debug-AzStorageAccountAuth` names most faults in one line and is worth more than any amount
+of symptom-reading. Run it from a Windows box:
+
+```powershell
+Install-Module AzFilesHybrid -Scope CurrentUser
+Debug-AzStorageAccountAuth -StorageAccountName <acct> -ResourceGroupName <rg> `
+  -UserName <upn> -FileShareName <share> -Verbose
+```
+
+**Three of its failures are not findings.** Acting on them wastes hours:
+
+| Reported | Why it is not a fault |
+|---|---|
+| `CheckRBAC` Failed, with `-UserName`/`-FileShareName` omitted | The check could not run. Supply both parameters |
+| `CheckRBAC` — *"User is a cloud-only user, cannot have RBAC access"* | A validator limitation: it looks for an `onPremisesSecurityIdentifier` and gives up when there is none. Entra Kerberos explicitly supports cloud-only identities — that is what the `kdc_enable_cloud_group_sids` tag is for |
+| `CheckRegKey` Failed, while `Lsa\Kerberos\Parameters` shows `1` and `klist` holds a CIFS ticket | It reads the PolicyManager CSP path, not the LSA path. **A CIFS ticket cannot be obtained with cloud retrieval disabled**, so the ticket outranks the check |
+
+If those are the only failures, the validator has found nothing — move to the layer it does
+not inspect: the NTFS ACL (step 7).
 
 
 ## The constraint you need to plan around

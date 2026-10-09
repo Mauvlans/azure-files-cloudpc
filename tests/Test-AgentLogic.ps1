@@ -211,6 +211,37 @@ Assert-Equal 'logon delay is long enough to outlast the observed CloudAP race' `
 Assert-Equal 'logon delay plus TGT wait stays inside the 15 minute task limit' `
     $true (($mf.logonDelaySeconds + 180) -lt 900)
 
+# --- 6. detection script contract --------------------------------------------
+#
+# Intune does not run the detection script from the package - the Management Extension
+# copies its content elsewhere and runs it with nothing beside it. A detection script
+# that reads package.json at runtime therefore ALWAYS fails closed, and the app
+# reinstalls on every evaluation cycle. That shipped once; these tests stop it coming
+# back.
+
+Write-Host ''
+Write-Host 'Detection script contract'
+
+$detectTemplate = Get-Content (Join-Path $repoRoot 'client/Detect-DriveMapAgent.ps1') -Raw
+
+Assert-Equal 'detection template does NOT read package.json at runtime' `
+    $false ($detectTemplate -match 'Join-Path\s+\$PSScriptRoot\s+''package\.json''')
+
+Assert-Equal 'detection template carries the version placeholder for the builder' `
+    $true ($detectTemplate -like '*__PACKAGE_VERSION__*')
+
+Assert-Equal 'detection template fails closed on an unsubstituted placeholder' `
+    $true ($detectTemplate -match "expectedVersion -like '__\*__'")
+
+# The builder must substitute every placeholder it promises to.
+$builder = Get-Content (Join-Path $repoRoot 'tools/Build-IntuneWinPackage.ps1') -Raw
+foreach ($token in @('__PACKAGE_VERSION__', '__TASK_NAME__', '__TASK_PATH__')) {
+    Assert-Equal "builder substitutes $token" $true ($builder -like "*$token*")
+}
+
+Assert-Equal 'builder refuses to emit a half-substituted detection rule' `
+    $true ($builder -match "unsubstituted placeholder")
+
 # --- result ------------------------------------------------------------------
 
 Write-Host ''

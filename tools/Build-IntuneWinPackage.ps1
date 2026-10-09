@@ -138,7 +138,43 @@ try {
         }
     }
 
-    Write-Host ''
+    # -------------------------------------------------------------------------
+    # Generate the detection script Intune will actually run.
+    #
+    # Intune does not execute the detection script from the package: the Management
+    # Extension copies its CONTENT elsewhere and runs it with no arguments and nothing
+    # beside it. package.json is therefore unreadable at detection time, so the expected
+    # values must be baked in here. client/package.json stays the single source of truth.
+    Write-Step 'Generating detection script'
+    $manifest   = Get-Content (Join-Path $clientDir 'package.json') -Raw | ConvertFrom-Json
+    $detectSrc  = Get-Content (Join-Path $clientDir 'Detect-DriveMapAgent.ps1') -Raw
+    $detectOut  = Join-Path $OutputPath 'Detect-DriveMapAgent.ps1'
+
+    foreach ($token in @('__PACKAGE_VERSION__', '__TASK_NAME__', '__TASK_PATH__')) {
+        if ($detectSrc -notlike "*$token*") {
+            throw ("client/Detect-DriveMapAgent.ps1 is missing the $token placeholder. " +
+                   "The detection rule cannot be generated without it.")
+        }
+    }
+
+    $detectSrc = $detectSrc.Replace('__PACKAGE_VERSION__', $manifest.packageVersion).
+                            Replace('__TASK_NAME__',       $manifest.taskName).
+                            Replace('__TASK_PATH__',       $manifest.taskPath)
+
+    # Never ship a half-substituted rule: an unmatched placeholder can never equal an
+    # installed version, so the app would reinstall forever with no visible cause.
+    if ($detectSrc -match '__[A-Z_]+__') {
+        throw "Detection script still contains an unsubstituted placeholder after generation."
+    }
+
+    Set-Content -Path $detectOut -Value $detectSrc -Encoding UTF8 -NoNewline
+    $check = Get-Content $detectOut -Raw
+    if ($check -notlike "*`$expectedVersion = '$($manifest.packageVersion)'*") {
+        throw "Generated detection script does not carry version $($manifest.packageVersion)."
+    }
+    Write-Ok "$detectOut (version $($manifest.packageVersion), task $($manifest.taskPath)$($manifest.taskName))"
+
+Write-Host ''
     Write-Host '================ PACKAGE READY ================' -ForegroundColor Green
     Write-Host "  File    : $pkg"
     Write-Host "  SHA-256 : $((Get-FileHash $pkg -Algorithm SHA256).Hash.ToLower())"
@@ -146,7 +182,8 @@ try {
     Write-Host '  Install command   : powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Install-DriveMapAgent.ps1'
     Write-Host '  Uninstall command : powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Uninstall-DriveMapAgent.ps1'
     Write-Host '  Install behavior  : System'
-    Write-Host '  Detection         : custom script Detect-DriveMapAgent.ps1 (64-bit, not as logged-on user)'
+    Write-Host "  Detection         : custom script $detectOut (64-bit, not as logged-on user)"
+    Write-Host '                      ^ upload THIS generated file, not client/Detect-DriveMapAgent.ps1'
     Write-Host ''
 }
 finally {
