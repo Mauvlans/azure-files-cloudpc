@@ -51,8 +51,8 @@ docs/
 
 ## Step-by-step deployment guide
 
-Follow these in order. **The order is not cosmetic** — steps 3 and 6 must both be done before
-step 7, or the agent installs successfully and then fails every mount, and you will spend your
+Follow these in order. **The order is not cosmetic** — steps 4 and 7 must both be done before
+step 8, or the agent installs successfully and then fails every mount, and you will spend your
 time debugging the agent instead of the thing actually blocking it.
 
 Budget roughly 90 minutes end to end, most of it waiting on propagation.
@@ -128,7 +128,80 @@ Output: `client/config.json`, containing your tenant ID and UNC path.
 
 ---
 
-### Step 2 — Deploy the Intune policies
+### Step 2 — Configure and verify Microsoft Entra Kerberos ⚠️ VERIFY, DO NOT ASSUME
+
+Step 1 already turns Entra Kerberos on (`directoryServiceOptions = AADKERB`) and configures the
+auto-created Entra application. **Verify it anyway.** Read every value back from ARM and Graph
+rather than trusting the script's own output — a build that printed "already correct" for the
+SPNs has shipped an account whose SPNs were entirely lowercase.
+
+```bash
+ACCT=<storageAccountName>; RG=<rg>; SUB=<sub-guid>
+
+# 1. Entra Kerberos is the account-wide identity source
+az rest --method get --url "https://management.azure.com/subscriptions/$SUB/resourceGroups/$RG/providers/Microsoft.Storage/storageAccounts/$ACCT?api-version=2023-05-01" \
+  | python3 -c "import json,sys;print(json.load(sys.stdin)['properties']['azureFilesIdentityBasedAuthentication'])"
+# expect: {'directoryServiceOptions': 'AADKERB'}
+
+# 2. The Entra app: UPPERCASE SPNs, cloud-SID tag, admin consent
+az rest --method get --url "https://graph.microsoft.com/v1.0/applications?\$filter=startswith(displayName,'[Storage Account] $ACCT')" \
+  | python3 -c "
+import json,sys
+a=json.load(sys.stdin)['value'][0]
+print('appId:',a['appId']);print('tags :',a.get('tags'))
+[print('  uri:',u) for u in a['identifierUris']]"
+```
+
+Three things must all be true:
+
+| Check | Expected | If wrong |
+|---|---|---|
+| `directoryServiceOptions` | `AADKERB` | Re-run step 1 |
+| `identifierUris` | **six** entries, all **UPPERCASE** `HOST/` `CIFS/` `HTTP/` (bare + `api://<tenant>/…`) | See below |
+| `tags` | contains `kdc_enable_cloud_group_sids` | Re-run step 1 with `-EnableCloudOnlyGroupSids` |
+| Admin consent | `AllPrincipals` — `openid profile User.Read` | Re-run step 1 with `-GrantAdminConsent` |
+
+**The SPN case trap.** Azure auto-creates these URIs in **lowercase** (`cifs/…`). Azure's own
+validator demands the uppercase form, and a lowercase SPN produces the single most misleading
+failure in this whole solution: Entra issues a valid AES-256 CIFS ticket, TCP 445 connects, the
+SMB session establishes — and then session setup surfaces as an interactive **"Enter the user
+name"** prompt with *no entry in the SMB Security event log at all*. It reads exactly like a
+credential or permissions problem and is neither.
+
+Graph rejects both cases at once (`DuplicateValueInDifferentCase`), so **replace** the set,
+never append:
+
+```powershell
+$objId = '<application objectId>'; $t = '<tenantId>'; $acct = '<account>.file.core.windows.net'
+$uris = @()
+foreach ($svc in 'HOST','CIFS','HTTP') { $uris += "api://$t/$svc/$acct"; $uris += "$svc/$acct" }
+Update-MgApplication -ApplicationId $objId -IdentifierUris $uris
+```
+
+Then on any client that already tried a mount: `klist purge`, followed by a **full sign-out and
+sign-in** — not a disconnect. The cloud TGT is supplied at logon and cannot be re-minted
+mid-session.
+
+> **Why this is a step and not a footnote.** `-contains` in PowerShell is case-insensitive, so
+> an idempotency check written the obvious way reports lowercase SPNs as already-correct. That
+> bug shipped in this repo and was only caught by reading Graph directly. Verify against the
+> API, not against a script's success message.
+
+Optionally run Microsoft's validator from a domain-reachable Windows box — it names the fault
+in one line and is worth more than any amount of symptom-reading:
+
+```powershell
+Install-Module AzFilesHybrid -Scope CurrentUser
+Debug-AzStorageAccountAuth -StorageAccountName $ACCT -ResourceGroupName $RG `
+  -UserName <upn> -FileShareName <share> -Verbose
+```
+
+Omitting `-UserName`/`-FileShareName` makes `CheckRBAC` report **Failed** when it simply could
+not run. That is not a finding.
+
+---
+
+### Step 3 — Deploy the Intune policies
 
 ```powershell
 Connect-MgGraph -Scopes 'DeviceManagementConfiguration.ReadWrite.All','Group.Read.All'
@@ -150,7 +223,7 @@ Creates two settings catalog policies:
 
 ---
 
-### Step 3 — Conditional Access exclusion ⚠️ REQUIRED, MANUAL
+### Step 4 — Conditional Access exclusion ⚠️ REQUIRED, MANUAL
 
 **Skip this and every mount fails with error 1327.** Not automatable, and it needs a security
 owner's sign-off.
@@ -169,7 +242,7 @@ internet regardless of this exclusion.
 
 ---
 
-### Step 4 — Verify the policy actually landed
+### Step 5 — Verify the policy actually landed
 
 Assigned is not the same as applied. On the pilot Cloud PC:
 
@@ -184,14 +257,14 @@ returns `1`; nothing downstream can work without it.
 
 ---
 
-### Step 5 — Wait for RBAC propagation
+### Step 6 — Wait for RBAC propagation
 
 Share-level role assignments take **up to 30 minutes**. Testing inside that window produces
 access-denied failures that look like a permissions bug but are just propagation delay.
 
 ---
 
-### Step 6 — Set NTFS ACLs ⚠️ REQUIRED, MANUAL
+### Step 7 — Set NTFS ACLs ⚠️ REQUIRED, MANUAL
 
 Share-level RBAC gets you *to* the share; NTFS ACLs control what you can do *inside* it. Both
 are required.
@@ -210,7 +283,7 @@ Then **remove the elevated role** — it exists only for this step.
 
 ---
 
-### Step 7 — Build and assign the Win32 app
+### Step 8 — Build and assign the Win32 app
 
 ```powershell
 Install-Module SvRooij.ContentPrep.Cmdlet -Scope CurrentUser   # once
@@ -239,7 +312,7 @@ will simply never appear.
 
 ---
 
-### Step 8 — Validate
+### Step 9 — Validate
 
 On the pilot Cloud PC, in a **normal (non-elevated)** user session:
 
@@ -258,10 +331,11 @@ Start with `Test-DriveMapReadiness.ps1`. Then match the symptom:
 
 | Symptom | Most likely cause |
 |---|---|
-| **`X:` never appears at all** | The Win32 app is not installed (step 7). No app means no scheduled task, and nothing creates the mapping. Verify: `Get-ScheduledTask -TaskPath '\AzureFilesDriveMap\'` |
-| **Error 1327** on mount | Conditional Access exclusion missing (step 3) |
+| **`X:` never appears at all** | The Win32 app is not installed (step 8). No app means no scheduled task, and nothing creates the mapping. Verify: `Get-ScheduledTask -TaskPath '\AzureFilesDriveMap\'` |
+| **Credential prompt** ("Enter the user name") with a valid CIFS ticket in `klist` and *no* SMB Security event | Lowercase SPNs in the Entra app's `identifierUris` (step 2) |
+| **Error 1327** on mount | Conditional Access exclusion missing (step 4) |
 | **Error 1326** on mount | Private endpoint mode with the privatelink FQDN missing from the app's `identifierUris` |
-| **Access denied** | Share RBAC not propagated yet (wait 30 min), or NTFS ACLs not set (step 6) |
+| **Access denied** | Share RBAC not propagated yet (wait 30 min), or NTFS ACLs not set (step 7) |
 | **Worked, now denied** | The ~10h cloud TGT expired. Sign out and back in — *disconnecting is not enough* |
 | **`CloudKerberosTicketRetrievalEnabled` absent** | Policy assigned but not yet applied. Force an Intune sync |
 | **TCP 445 unreachable** | Service endpoint or firewall rule missing, or the Cloud PC is not on the ANC vNet |
