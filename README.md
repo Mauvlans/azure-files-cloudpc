@@ -47,6 +47,12 @@ tests/
 docs/
   Deployment-westus3.md             A real verified deployment: environment findings,
                                     results read back from ARM/Graph, bugs found, teardown.
+  Deployment-westus3-<storageaccount>.md  Second deployment. Root cause of a credential-prompt
+                                    failure: share RBAC and the NTFS ACL named different
+                                    groups. Current SMB settings and outstanding work.
+  Set-RootAcl-RestApi.md            Set the share-root NTFS ACL from Linux/macOS over the
+                                    Files REST API. No Windows box, no storage key.
+  AD-DS-Auth-Notes.md               AD DS (vs Entra Kerberos) auth notes and gotchas.
 ```
 
 ## Step-by-step deployment guide
@@ -199,6 +205,16 @@ Debug-AzStorageAccountAuth -StorageAccountName $ACCT -ResourceGroupName $RG `
 Omitting `-UserName`/`-FileShareName` makes `CheckRBAC` report **Failed** when it simply could
 not run. That is not a finding.
 
+**Two more validator results that are NOT findings, when your users are cloud-only:**
+
+| Reported | Why it is not a fault |
+|---|---|
+| `CheckRBAC` — *"User is a cloud-only user, cannot have RBAC access"* | A validator limitation: it looks for an `onPremisesSecurityIdentifier` and gives up when there is none. Entra Kerberos explicitly supports cloud-only identities — that is what the `kdc_enable_cloud_group_sids` tag is for. Confirm the share-scope role assignment exists and move on. |
+| `CheckRegKey` — Failed, while `Lsa\Kerberos\Parameters` shows `1` and `klist` holds a CIFS ticket | It reads the PolicyManager CSP path, not the LSA path. **A CIFS ticket cannot be obtained with cloud retrieval disabled**, so the ticket outranks the check. |
+
+If these two are the validator's only failures, it has found nothing. Do not invent a theory
+to explain them — move to the layer it does not inspect: the NTFS ACL (step 7).
+
 ---
 
 ### Step 3 — Deploy the Intune policies
@@ -269,17 +285,39 @@ access-denied failures that look like a permissions bug but are just propagation
 Share-level RBAC gets you *to* the share; NTFS ACLs control what you can do *inside* it. Both
 are required.
 
+> **⚠️ The two layers must name the SAME principal.** This is the single easiest way to build
+> a share where every check passes and no one can mount it. Share RBAC and the NTFS ACL are
+> set by different steps, in different tools, and they drift — a user who clears one gate but
+> not the other gets an interactive **credential prompt**, not a clean access-denied, which
+> sends you off debugging Kerberos. Before you write any ACL, confirm which group holds the
+> share-scope role, and grant *that* group here. A policy-assignment group and a data-access
+> group with similar names are very easy to confuse.
+
+```bash
+az role assignment list \
+  --scope ".../storageAccounts/<acct>/fileServices/default/fileshares/<share>" -o table
+```
+
+**Check whether the root already has a descriptor before assuming it needs one.** A genuinely
+new root has none at all, but a share that has ever been used carries a real one — possibly
+granting the wrong group. Listing the root and finding existing directories is the tell.
+
 From a pilot Cloud PC, signed in as a member of the admin group (which holds *Storage File Data
 SMB Share Elevated Contributor*):
 
 ```powershell
 net use Z: \\<storageaccount>.file.core.windows.net\<share>
-icacls Z:\ /grant "<your-user-group>:(OI)(CI)M"
-icacls Z:\ /remove "Authenticated Users"
+icacls Z:\                                          # READ IT FIRST
+icacls Z:\ /grant "<share-rbac-group>:(OI)(CI)M"    # the group from the RBAC query above
 net use Z: /delete
 ```
 
 Then **remove the elevated role** — it exists only for this step.
+
+**No Windows box?** The Files REST API can set the root descriptor directly, with no storage
+key — see [`docs/Set-RootAcl-RestApi.md`](docs/Set-RootAcl-RestApi.md). Note it needs
+`Storage File Data Privileged Contributor`; *Elevated Contributor* is not sufficient for the
+REST path and returns `AuthorizationPermissionMismatch`.
 
 ---
 
@@ -332,7 +370,7 @@ Start with `Test-DriveMapReadiness.ps1`. Then match the symptom:
 | Symptom | Most likely cause |
 |---|---|
 | **`X:` never appears at all** | The Win32 app is not installed (step 8). No app means no scheduled task, and nothing creates the mapping. Verify: `Get-ScheduledTask -TaskPath '\AzureFilesDriveMap\'` |
-| **Credential prompt** ("Enter the user name") with a valid CIFS ticket in `klist` and *no* SMB Security event | Lowercase SPNs in the Entra app's `identifierUris` (step 2) |
+| **Credential prompt** ("Enter the user name") with a valid CIFS ticket in `klist` and *no* SMB Security event | Two possible causes, both of which pass every individual check: (a) lowercase SPNs in the Entra app's `identifierUris` (step 2); (b) **share RBAC and the NTFS root ACL name different groups** (steps 1 and 7) — each gate is valid alone, but no principal clears both |
 | **Error 1327** on mount | Conditional Access exclusion missing (step 4) |
 | **Error 1326** on mount | Private endpoint mode with the privatelink FQDN missing from the app's `identifierUris` |
 | **Access denied** | Share RBAC not propagated yet (wait 30 min), or NTFS ACLs not set (step 7) |
@@ -412,6 +450,13 @@ Read the spec for the full mitigation ladder before committing to a rollout date
 live tenant: environment pre-flight, why ServiceEndpoint was chosen over PrivateEndpoint on
 a vNet with on-prem DNS, every resource property read back from ARM/Graph, the four bugs the
 execution exposed, and teardown.
+
+[`docs/Deployment-westus3-<storageaccount>.md`](docs/Deployment-westus3-<storageaccount>.md) records a
+second deployment, worth reading for two things the first did not hit: a bug in this repo's
+own SPN-case idempotency check that reported success on an entirely lowercase account, and
+the root cause of a credential-prompt mount failure — **share-level RBAC and the NTFS root
+ACL named different groups**. It also documents the current (deliberately lowered) SMB
+settings on that account and the work still outstanding.
 
 ## Contributing
 
