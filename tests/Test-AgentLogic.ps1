@@ -144,6 +144,73 @@ Assert-Equal 'no wasted sleep after the final attempt' `
 Assert-Equal 'worst-case preflight stays well inside the 15 minute task limit' `
     $true ((Get-BackoffTotal $backoff $max $true) -lt 600)
 
+# --- 5. logon TGT race -------------------------------------------------------
+#
+# Both regressions below were found on a live Cloud PC, not by these tests. The
+# agent logged "Re-acquisition succeeded" and then failed the mount with "The
+# specified network password is not correct" (exit 4); the next run four minutes
+# later mapped cleanly with no intervention.
+
+Write-Host ''
+Write-Host 'Logon TGT race'
+
+# Mirrors the success condition inside Invoke-TgtReacquisition.
+function Test-ReacquisitionProved {
+    param([AllowNull()] [object] $Tgt)
+    if (-not $Tgt -or -not $Tgt.Present) { return $false }
+    if ($Tgt.ParseFailed) { return $false }
+    return ($Tgt.MinutesRemaining -gt 60)
+}
+
+Assert-Equal 'an unparseable TGT is NOT proof that re-acquisition worked' `
+    $false (Test-ReacquisitionProved ([pscustomobject]@{ Present = $true; ParseFailed = $true; MinutesRemaining = $null }))
+
+Assert-Equal 'an absent TGT is not proof of re-acquisition' `
+    $false (Test-ReacquisitionProved ([pscustomobject]@{ Present = $false; ParseFailed = $false; MinutesRemaining = $null }))
+
+Assert-Equal 'a readable TGT with real life left does prove re-acquisition' `
+    $true (Test-ReacquisitionProved ([pscustomobject]@{ Present = $true; ParseFailed = $false; MinutesRemaining = 595.9 }))
+
+# Mirrors the $needsRenewal expression in the main flow.
+function Test-NeedsRenewal {
+    param([object] $Tgt, [int] $ThresholdMinutes)
+    return ($Tgt.Present -and (-not $Tgt.ParseFailed) -and ($Tgt.MinutesRemaining -lt $ThresholdMinutes))
+}
+
+$threshold = $cfg.tgt.renewThresholdMinutes
+
+Assert-Equal 'a MISSING TGT does not enter the renewal path (it cannot be renewed into existence)' `
+    $false (Test-NeedsRenewal ([pscustomobject]@{ Present = $false; ParseFailed = $false; MinutesRemaining = $null }) $threshold)
+
+Assert-Equal 'a TGT near expiry does enter the renewal path' `
+    $true (Test-NeedsRenewal ([pscustomobject]@{ Present = $true; ParseFailed = $false; MinutesRemaining = 10 }) $threshold)
+
+Assert-Equal 'a healthy TGT does not enter the renewal path' `
+    $false (Test-NeedsRenewal ([pscustomobject]@{ Present = $true; ParseFailed = $false; MinutesRemaining = 595.9 }) $threshold)
+
+# Exit-code classification: a missing TGT is a transient race (6), not a hard fault (4).
+function Get-MapFailureExitCode {
+    param([string] $AuthMode, [object] $Tgt)
+    if ($AuthMode -eq 'EntraKerberos' -and -not $Tgt.Present) { return 6 }
+    return 4
+}
+
+Assert-Equal 'map failure with no TGT yet is reported as transient (6)' `
+    6 (Get-MapFailureExitCode 'EntraKerberos' ([pscustomobject]@{ Present = $false }))
+
+Assert-Equal 'map failure WITH a valid TGT is a real failure (4)' `
+    4 (Get-MapFailureExitCode 'EntraKerberos' ([pscustomobject]@{ Present = $true }))
+
+Assert-Equal 'ADDS never reports the Entra logon race' `
+    4 (Get-MapFailureExitCode 'ADDS' ([pscustomobject]@{ Present = $false }))
+
+# The logon delay must leave room for CloudAP inside the task's 15 minute limit.
+Assert-Equal 'logon delay is long enough to outlast the observed CloudAP race' `
+    $true ($mf.logonDelaySeconds -ge 120)
+
+Assert-Equal 'logon delay plus TGT wait stays inside the 15 minute task limit' `
+    $true (($mf.logonDelaySeconds + 180) -lt 900)
+
 # --- result ------------------------------------------------------------------
 
 Write-Host ''

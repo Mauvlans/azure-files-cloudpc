@@ -370,6 +370,7 @@ Start with `Test-DriveMapReadiness.ps1`. Then match the symptom:
 | Symptom | Most likely cause |
 |---|---|
 | **`X:` never appears at all** | The Win32 app is not installed (step 8). No app means no scheduled task, and nothing creates the mapping. Verify: `Get-ScheduledTask -TaskPath '\AzureFilesDriveMap\'` |
+| **Scheduled task returns `0x4`, but running the agent manually works** | That is the agent's own exit code, not a Task Scheduler fault — a `required` mapping failed. At an `-AtLogOn` trigger the agent can run before CloudAP has delivered the cloud TGT, so the mount fails and the next run succeeds unaided. Agent ≥1.2.0 waits for the ticket and reports this case as **`0x6`** (transient) instead. On `0x4`, read the log: a real failure has a valid TGT in it. |
 | **Credential prompt** ("Enter the user name") with a valid CIFS ticket in `klist` and *no* SMB Security event | Two possible causes, both of which pass every individual check: (a) lowercase SPNs in the Entra app's `identifierUris` (step 2); (b) **share RBAC and the NTFS root ACL name different groups** (steps 1 and 7) — each gate is valid alone, but no principal clears both |
 | **Error 1327** on mount | Conditional Access exclusion missing (step 4) |
 | **Error 1326** on mount | Private endpoint mode with the privatelink FQDN missing from the app's `identifierUris` |

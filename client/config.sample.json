@@ -16,9 +16,11 @@
   },
 
   "_comment_tgt": "Only used when authMode is EntraKerberos. The ADDS path skips all of this - on-prem TGTs renew natively.",
+  "_comment_logonTgtWait": "Seconds to wait at logon for CloudAP to deliver the cloud TGT before giving up on this run. The TGT is TicketSuppliedAtLogon and cannot be minted mid-session, so an -AtLogOn run that finds no ticket must WAIT, not attempt re-acquisition. Optional; defaults to 180.",
   "tgt": {
     "renewThresholdMinutes": 45,
     "maxRenewAttempts": 3,
+    "logonTgtWaitSeconds": 180,
     "notifyUserOnFailure": true,
     "allowTicketPurge": false
   },

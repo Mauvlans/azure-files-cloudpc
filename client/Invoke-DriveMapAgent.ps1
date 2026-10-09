@@ -32,6 +32,8 @@
 
     Exit codes: 0 success | 2 kerberos unrecoverable | 3 network unreachable | 4 map failed
                 5 unhandled exception (see the UNHANDLED line in the log, event 3006)
+                6 map failed, cloud TGT not yet delivered (transient logon race - the next
+                  scheduled run is expected to succeed without intervention)
 #>
 [CmdletBinding()]
 param(
@@ -144,6 +146,45 @@ function Test-TgtUsable {
     return ($Tgt.MinutesRemaining -gt 60)
 }
 
+function Wait-ForLogonTgt {
+    <#
+        Waits for CloudAP to deliver the cloud TGT early in a logon session.
+
+        The cloud TGT is TicketSuppliedAtLogon: it arrives as part of logon processing
+        and CANNOT be minted mid-session by any client action. At an -AtLogOn trigger
+        the agent regularly runs before CloudAP has finished, so "no TGT" at that moment
+        is a RACE, not a failure - the ticket shows up on its own moments later.
+
+        Re-acquisition is the wrong tool here and actively misleads: dsregcmd /RefreshPrt
+        refreshes the Entra PRT, which is a different artefact and cannot produce a TGT.
+        Observed on a real Cloud PC - the agent reported "Re-acquisition succeeded"
+        at 09:57 and the mount immediately failed with "The specified network password
+        is not correct"; the next scheduled run at 10:01 found a valid TGT and mapped
+        cleanly with no intervention. Waiting is the correct behaviour.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [string] $Realm,
+        [int] $TimeoutSeconds = 180,
+        [int] $PollSeconds = 10
+    )
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    $waited   = 0
+    while ((Get-Date) -lt $deadline) {
+        Start-Sleep -Seconds $PollSeconds
+        $waited += $PollSeconds
+        $t = Get-CloudTgt -Realm $Realm
+        if ($t.Present) {
+            Write-AgentLog "Cloud TGT appeared after ${waited}s of logon wait" -EventId 2003
+            return $t
+        }
+    }
+
+    Write-AgentLog "No cloud TGT after ${TimeoutSeconds}s of waiting" -Level Warning
+    return (Get-CloudTgt -Realm $Realm)
+}
+
 function Invoke-TgtReacquisition {
     <#
         Best-effort re-acquisition of the cloud TGT without signing the user out.
@@ -186,9 +227,19 @@ function Invoke-TgtReacquisition {
     Start-Sleep -Seconds 3
 
     $tgt = Get-CloudTgt
-    if (Test-TgtUsable -Tgt $tgt) {
+    # A ParseFailed ticket must NOT count as proof here. Test-TgtUsable treats an
+    # unparseable expiry as usable, which is the right bias when deciding whether to
+    # leave a working cache alone - but as evidence that re-acquisition WORKED it is
+    # worthless, and it produced a "Re-acquisition succeeded" line on a real Cloud PC
+    # moments before the mount failed. Claim success only on a ticket we can actually
+    # read and that has real life left on it.
+    if ($tgt.Present -and -not $tgt.ParseFailed -and $tgt.MinutesRemaining -gt 60) {
         Write-AgentLog 'Re-acquisition succeeded without purging the ticket cache' -EventId 2002
         return $true
+    }
+    if ($tgt.Present -and $tgt.ParseFailed) {
+        Write-AgentLog ('A TGT is present but its expiry could not be parsed - not treating ' +
+                        'that as re-acquisition success. Falling through.') -Level Warning
     }
 
     # --- 3. destructive: only when there is nothing left to lose ---------------
@@ -415,6 +466,13 @@ if ($config.PSObject.Properties.Name -contains 'authMode' -and $config.authMode)
     $authMode = [string]$config.authMode
 }
 
+# How long to wait at logon for CloudAP to deliver the cloud TGT before giving up on
+# this run. Optional; the default covers the race observed on real Cloud PCs.
+$logonTgtWaitSeconds = 180
+if ($config.tgt.PSObject.Properties.Name -contains 'logonTgtWaitSeconds' -and $config.tgt.logonTgtWaitSeconds) {
+    $logonTgtWaitSeconds = [int]$config.tgt.logonTgtWaitSeconds
+}
+
 if ($authMode -eq 'ADDS') {
     # On-prem AD DS Kerberos. The TGT is renewable (klist shows a Renew Time days
     # out) and LSA renews it without help, so there is no ceiling to work around
@@ -442,11 +500,23 @@ if ($tgt.Present -and -not $tgt.ParseFailed) {
 } elseif ($tgt.Present) {
     Write-AgentLog 'Cloud TGT present (expiry unknown)'
 } else {
-    Write-AgentLog 'No cloud TGT in this logon session' -Level Warning
+    # No TGT at all. Early in a logon session this is a RACE, not a fault: the cloud
+    # TGT is TicketSuppliedAtLogon and arrives when CloudAP finishes, which can be
+    # well after an -AtLogOn trigger fires. Wait for it rather than running the
+    # re-acquisition path, which cannot mint a logon-time ticket and only wastes
+    # time before a mount that was always going to fail.
+    Write-AgentLog 'No cloud TGT in this logon session yet - waiting for CloudAP' -Level Warning
+    $tgt = Wait-ForLogonTgt -Realm $config.kerberosRealm -TimeoutSeconds $logonTgtWaitSeconds
+    if ($tgt.Present -and -not $tgt.ParseFailed) {
+        Write-AgentLog ("Cloud TGT valid for {0} minutes (expires {1:yyyy-MM-dd HH:mm})" -f $tgt.MinutesRemaining, $tgt.EndTime)
+    }
 }
 
-$needsRenewal = (-not $tgt.Present) -or
-                ((-not $tgt.ParseFailed) -and $tgt.MinutesRemaining -lt $config.tgt.renewThresholdMinutes)
+# Renewal applies only to a ticket that EXISTS and is near expiry. A ticket that never
+# arrived cannot be renewed into existence, so it must not enter this path.
+$needsRenewal = $tgt.Present -and
+                (-not $tgt.ParseFailed) -and
+                ($tgt.MinutesRemaining -lt $config.tgt.renewThresholdMinutes)
 
 if ($needsRenewal) {
     # Destructive ticket-cache purge is OPT-IN. It is only ever reached when the TGT is
@@ -492,7 +562,19 @@ foreach ($m in $config.mappings) {
     if (-not $ok -and $m.required) { $failedRequired = $true }
 }
 
-if ($failedRequired -and $script:ExitCode -eq 0) { $script:ExitCode = 4 }
+if ($failedRequired -and $script:ExitCode -eq 0) {
+    # Distinguish a transient logon race from a real failure. If the required mapping
+    # failed because the cloud TGT had not arrived yet, the next scheduled run will
+    # almost certainly succeed unaided - reporting that as a hard failure sends people
+    # to debug an agent that is working correctly. Exit 6 says "retry pending".
+    if ($authMode -eq 'EntraKerberos' -and -not $tgt.Present) {
+        Write-AgentLog ('Required mapping failed and no cloud TGT is present yet. This is the ' +
+                        'logon race, not a configuration fault - the next run should succeed.') -Level Warning -EventId 2004
+        $script:ExitCode = 6
+    } else {
+        $script:ExitCode = 4
+    }
+}
 
 }
 catch {
